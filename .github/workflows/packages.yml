@@ -1,7 +1,8 @@
 name: Packages
 
-# Daily: if Zoraxy has a new stable release, build .deb/.rpm packages from its
-# official binaries, test them and publish them as a release of this repository.
+# Daily: if Zoraxy has a new stable release, build .deb/.rpm packages and the
+# Windows setup from its official binaries, test them and publish them as a
+# release of this repository.
 # Push / pull request: build and test only.
 
 on:
@@ -90,6 +91,27 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  build-windows:
+    needs: resolve
+    if: needs.resolve.outputs.publish == 'true' || github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - name: Install NSIS
+        run: sudo apt-get update && sudo apt-get install -y nsis
+
+      - name: Build the setup
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: make windows VERSION=${{ needs.resolve.outputs.version }} RELEASE=${{ needs.resolve.outputs.release }}
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: packages-windows
+          path: dist/*
+          if-no-files-found: error
+
   test-deb:
     needs: [resolve, build]
     runs-on: ubuntu-latest
@@ -149,8 +171,60 @@ jobs:
             test ! -e /usr/bin/zoraxy
           '
 
+  test-windows:
+    needs: [resolve, build-windows]
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: packages-windows
+
+      - name: Silent install starts the service
+        run: |
+          $setup = (Get-ChildItem zoraxy-*-windows-amd64-setup.exe).FullName
+          $p = Start-Process $setup -ArgumentList '/S' -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "setup exit code $($p.ExitCode)" }
+          $svc = Get-CimInstance Win32_Service -Filter "Name='zoraxy'"
+          "service: $($svc.State), start mode $($svc.StartMode), account $($svc.StartName)"
+          if ($svc.StartName -ne 'NT AUTHORITY\LocalService') { throw "unexpected service account" }
+          $code = '000'
+          for ($i = 0; $i -lt 30 -and $code -eq '000'; $i++) {
+            $code = curl.exe -s -o NUL -w '%{http_code}' http://127.0.0.1:8000/
+            if ($code -eq '000') { Start-Sleep 1 }
+          }
+          if ($code -eq '000') { Get-Content "$env:ProgramData\Zoraxy\log\service\*" -ErrorAction SilentlyContinue; throw "management UI not reachable" }
+          "management UI: $code"
+          & 'C:\Program Files\Zoraxy\zoraxy.exe' -version
+          Get-ChildItem "$env:ProgramData\Zoraxy" | Select-Object -ExpandProperty Name
+          $fw = Get-NetFirewallRule -DisplayName Zoraxy -ErrorAction SilentlyContinue
+          if (-not $fw) { throw "firewall rules missing" }
+          $fw | Format-Table DisplayName, Direction, Action, Enabled
+
+      - name: Upgrade keeps the service configuration
+        run: |
+          $xml = 'C:\Program Files\Zoraxy\zoraxy-service.xml'
+          Add-Content $xml '<!-- local change -->'
+          $p = Start-Process (Get-ChildItem zoraxy-*-windows-amd64-setup.exe).FullName -ArgumentList '/S' -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "setup exit code $($p.ExitCode)" }
+          if (-not (Select-String -Path $xml -Pattern 'local change' -Quiet)) { throw "configuration overwritten" }
+          (Get-Service zoraxy).WaitForStatus('Running', '00:00:30')
+          "service: $((Get-Service zoraxy).Status)"
+
+      - name: Silent removal
+        run: |
+          $p = Start-Process 'C:\Program Files\Zoraxy\uninstall.exe' -ArgumentList '/S', '_?=C:\Program Files\Zoraxy' -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "uninstall exit code $($p.ExitCode)" }
+          if (Get-Service zoraxy -ErrorAction SilentlyContinue) { throw "service still installed" }
+          if (Test-Path 'C:\Program Files\Zoraxy\zoraxy.exe') { throw "zoraxy.exe still present" }
+          if (Get-NetFirewallRule -DisplayName Zoraxy -ErrorAction SilentlyContinue) { throw "firewall rules still present" }
+          if (-not (Test-Path "$env:ProgramData\Zoraxy\sys.db")) { throw "data directory removed" }
+          "removed; data kept in $env:ProgramData\Zoraxy"
+
   publish:
-    needs: [resolve, test-deb, test-rpm]
+    needs: [resolve, test-deb, test-rpm, test-windows]
     if: needs.resolve.outputs.publish == 'true'
     runs-on: ubuntu-latest
     permissions:
@@ -178,6 +252,8 @@ jobs:
           \`\`\`
 
           Review \`/etc/default/zoraxy\` (deb) or \`/etc/sysconfig/zoraxy\` (rpm), then \`sudo systemctl enable --now zoraxy\`.
+
+          **Windows (x64):** run \`zoraxy-$VERSION-*-windows-amd64-setup.exe\` (silent: \`/S\`). It installs the \`zoraxy\` service (WinSW) and the management interface answers on http://127.0.0.1:8000/. The setup is not code-signed, so SmartScreen may ask for confirmation.
           EOF
           prerelease=""
           case "$VERSION" in *-*) prerelease=--prerelease ;; esac

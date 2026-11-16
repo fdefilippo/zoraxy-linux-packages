@@ -3,6 +3,7 @@
 #   make packages            # .deb and .rpm for ARCH
 #   make deb | rpm           # one format only
 #   make all-arch            # .deb and .rpm for every supported architecture
+#   make windows             # Windows x64 setup (.exe, NSIS + WinSW service)
 #   make clean
 #
 # Variables:
@@ -12,7 +13,8 @@
 #   BINARY      package this binary instead of downloading the release asset
 #   MAINTAINER  maintainer/packager field
 #
-# Requirements: curl, python3, sha256sum; dpkg-deb for .deb, rpmbuild for .rpm.
+# Requirements: curl, python3, sha256sum; dpkg-deb for .deb, rpmbuild for .rpm,
+# makensis for the Windows setup.
 # Output: dist/
 
 ARCHES     := amd64 arm64 arm 386 riscv64
@@ -40,20 +42,29 @@ RPM_ARCH_arm     := armv7hl
 RPM_ARCH_386     := i686
 RPM_ARCH_riscv64 := riscv64
 
+# Windows service wrapper (https://github.com/winsw/winsw), pinned by SHA-256
+WINSW_VERSION := 2.12.0
+WINSW_SHA256  := b5066b7bbdfba1293e5d15cda3caaea88fbeab35bd5b38c41c913d492aadfc4f
+WIN_BUILD     := build/$(VERSION)/windows
+# x.x.x.x version for the setup metadata (pre-release suffix dropped)
+VI_VERSION    := $(firstword $(subst -, ,$(VERSION))).$(RELEASE)
+
 DEB_ARCH   := $(DEB_ARCH_$(ARCH))
 RPM_ARCH   := $(RPM_ARCH_$(ARCH))
 # "-" is not allowed in RPM versions; "~" sorts pre-releases (3.4.0~rc1) before the release
 PKG_VERSION := $(subst -,~,$(VERSION))
 
-.PHONY: packages deb rpm all-arch check clean
+.PHONY: packages deb rpm all-arch windows check check-version clean
 
 packages: deb rpm
 
 all-arch:
 	@for a in $(ARCHES); do $(MAKE) --no-print-directory packages ARCH=$$a VERSION=$(VERSION) RELEASE=$(RELEASE) || exit 1; done
 
-check:
+check-version:
 	@test -n "$(VERSION)" || { echo "cannot find the latest Zoraxy release, set VERSION="; exit 1; }
+
+check: check-version
 	@test -n "$(DEB_ARCH)" || { echo "unsupported ARCH '$(ARCH)' ($(ARCHES))"; exit 1; }
 
 $(BUILD)/zoraxy: | check
@@ -88,6 +99,24 @@ rpm: check $(BINARY)
 		rpm/zoraxy.spec
 	@mkdir -p $(OUT)
 	cp $(BUILD)/rpm/RPMS/*/zoraxy-*.rpm $(OUT)/
+
+$(WIN_BUILD)/zoraxy.exe: | check-version
+	./scripts/upstream.sh fetch $(VERSION) windows_amd64 $@
+
+$(WIN_BUILD)/zoraxy-service.exe:
+	@mkdir -p $(WIN_BUILD)
+	curl -fsSL --retry 3 -o $@.part https://github.com/winsw/winsw/releases/download/v$(WINSW_VERSION)/WinSW.NET461.exe
+	echo "$(WINSW_SHA256)  $@.part" | sha256sum -c --quiet -
+	mv $@.part $@
+
+windows: check-version $(WIN_BUILD)/zoraxy.exe $(WIN_BUILD)/zoraxy-service.exe
+	sed 's/$$/\r/' windows/zoraxy-service.xml > $(WIN_BUILD)/zoraxy-service.xml
+	sed 's/$$/\r/' LICENSE > $(WIN_BUILD)/LICENSE.txt
+	@mkdir -p $(OUT)
+	makensis -V2 -DVERSION=$(VERSION) -DRELEASE=$(RELEASE) -DVI_VERSION=$(VI_VERSION) \
+		-DSRCDIR=$(abspath $(WIN_BUILD)) \
+		-DOUTFILE=$(abspath $(OUT))/zoraxy-$(VERSION)-$(RELEASE)-windows-amd64-setup.exe \
+		windows/zoraxy.nsi
 
 clean:
 	rm -rf build $(OUT)
