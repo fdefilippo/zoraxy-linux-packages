@@ -1,0 +1,185 @@
+name: Packages
+
+# Daily: if Zoraxy has a new stable release, build .deb/.rpm packages from its
+# official binaries, test them and publish them as a release of this repository.
+# Push / pull request: build and test only.
+
+on:
+  schedule:
+    - cron: '17 5 * * *'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Zoraxy version, e.g. 3.3.5 (empty: latest stable release)'
+        required: false
+      release:
+        description: 'Package revision'
+        default: '1'
+      publish:
+        description: 'Publish a release (skipped if the tag already exists)'
+        type: boolean
+        default: true
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: packages-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      release: ${{ steps.v.outputs.release }}
+      tag: ${{ steps.v.outputs.tag }}
+      publish: ${{ steps.v.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - id: v
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_RELEASE: ${{ inputs.release }}
+          INPUT_PUBLISH: ${{ inputs.publish }}
+        run: |
+          version=${INPUT_VERSION#v}
+          [ -n "$version" ] || version=$(scripts/upstream.sh latest)
+          release=${INPUT_RELEASE:-1}
+          tag="v$version-$release"
+          publish=false
+          if [ "$EVENT" = schedule ] || { [ "$EVENT" = workflow_dispatch ] && [ "$INPUT_PUBLISH" = true ]; }; then
+            if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              echo "$tag is already published"
+            else
+              publish=true
+            fi
+          fi
+          echo "Zoraxy $version, package revision $release, tag $tag, publish=$publish"
+          { echo "version=$version"; echo "release=$release"; echo "tag=$tag"; echo "publish=$publish"; } >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: resolve
+    # nothing to do on the daily run when the release is already published
+    if: needs.resolve.outputs.publish == 'true' || github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        arch: [amd64, arm64, arm, 386, riscv64]
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - name: Install rpmbuild
+        run: sudo apt-get update && sudo apt-get install -y rpm
+
+      - name: Build packages
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: make packages ARCH=${{ matrix.arch }} VERSION=${{ needs.resolve.outputs.version }} RELEASE=${{ needs.resolve.outputs.release }}
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: packages-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  test-deb:
+    needs: [resolve, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: packages-amd64
+
+      - name: Install and start the service
+        run: |
+          sudo apt-get install -y ./zoraxy_*_amd64.deb
+          zoraxy -version | grep -F "${{ needs.resolve.outputs.version }}"
+          sudo systemctl enable --now zoraxy
+          for i in $(seq 30); do curl -fsS -o /dev/null http://127.0.0.1:8000/ && break; sleep 1; done
+          curl -fsS -o /dev/null -w "management UI: %{http_code}\n" http://127.0.0.1:8000/
+          systemctl is-active zoraxy
+          sudo ls /var/lib/zoraxy
+
+      - name: Reinstall keeps the local configuration
+        run: |
+          echo '# local change' | sudo tee -a /etc/default/zoraxy
+          sudo apt-get install -y --reinstall ./zoraxy_*_amd64.deb
+          grep -q 'local change' /etc/default/zoraxy
+          systemctl is-active zoraxy
+
+      - name: Remove
+        run: |
+          sudo apt-get purge -y zoraxy
+          if systemctl is-active --quiet zoraxy; then exit 1; fi
+          test ! -e /usr/bin/zoraxy
+
+  test-rpm:
+    needs: [resolve, build]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        image: ['oraclelinux:8', 'oraclelinux:9', 'fedora:latest']
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: packages-amd64
+
+      - name: Install, run and remove in ${{ matrix.image }}
+        run: |
+          docker run --rm -v "$PWD:/p:ro" ${{ matrix.image }} bash -euxc '
+            dnf install -y /p/zoraxy-*.x86_64.rpm
+            rpm -V zoraxy
+            id zoraxy
+            test "$(stat -c %U:%a /var/lib/zoraxy)" = zoraxy:750
+            command -v setpriv >/dev/null || dnf install -y -q util-linux
+            cd /var/lib/zoraxy
+            setpriv --reuid zoraxy --regid zoraxy --init-groups /usr/bin/zoraxy -mdns=false -default_inbound_enabled=false >/tmp/zoraxy.log 2>&1 &
+            for i in $(seq 30); do curl -fsS -o /dev/null http://127.0.0.1:8000/ && break; sleep 1; done
+            curl -fsS -o /dev/null -w "management UI: %{http_code}\n" http://127.0.0.1:8000/ || { cat /tmp/zoraxy.log; exit 1; }
+            kill %1; wait || true
+            dnf remove -y zoraxy
+            test ! -e /usr/bin/zoraxy
+          '
+
+  publish:
+    needs: [resolve, test-deb, test-rpm]
+    if: needs.resolve.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: packages-*
+          merge-multiple: true
+          path: dist
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+        run: |
+          cd dist && sha256sum * > SHA256SUMS && cd ..
+          cat > notes.md <<EOF
+          Packages of the official [Zoraxy v$VERSION](https://github.com/tobychui/zoraxy/releases/tag/v$VERSION) binaries (SHA-256 verified against the upstream release).
+
+          \`\`\`sh
+          sudo apt install ./zoraxy_*_amd64.deb      # Debian, Ubuntu
+          sudo dnf install ./zoraxy-*.x86_64.rpm     # RHEL, Oracle Linux, Rocky, Alma, Fedora
+          \`\`\`
+
+          Review \`/etc/default/zoraxy\` (deb) or \`/etc/sysconfig/zoraxy\` (rpm), then \`sudo systemctl enable --now zoraxy\`.
+          EOF
+          prerelease=""
+          case "$VERSION" in *-*) prerelease=--prerelease ;; esac
+          gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "Zoraxy $VERSION" --notes-file notes.md $prerelease
