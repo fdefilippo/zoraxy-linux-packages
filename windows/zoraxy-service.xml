@@ -1,0 +1,33 @@
+<!--
+  Zoraxy Windows service (WinSW 2.x configuration).
+  Edit <arguments> to change the command line options (see "zoraxy.exe -h"), then
+  restart the service:  Restart-Service zoraxy
+  This file is kept when Zoraxy is upgraded.
+-->
+<service>
+  <id>zoraxy</id>
+  <name>Zoraxy</name>
+  <description>Zoraxy reverse proxy and forwarding tool</description>
+  <executable>%BASE%\zoraxy.exe</executable>
+  <!--
+    The management interface listens on 127.0.0.1:8000 only: on the first visit it
+    asks to create the admin account. Use -port=:8000 to reach it from other hosts.
+  -->
+  <arguments>-port=127.0.0.1:8000 -mdns=false</arguments>
+  <!-- data directory: sys.db, conf, log, plugins, www -->
+  <workingdirectory>%ProgramData%\Zoraxy</workingdirectory>
+  <logpath>%ProgramData%\Zoraxy\log\service</logpath>
+  <log mode="roll-by-size">
+    <sizeThreshold>10240</sizeThreshold>
+    <keepFiles>8</keepFiles>
+  </log>
+  <startmode>Automatic</startmode>
+  <onfailure action="restart" delay="10 sec"/>
+  <onfailure action="restart" delay="30 sec"/>
+  <resetfailure>1 hour</resetfailure>
+  <stoptimeout>15 sec</stoptimeout>
+  <serviceaccount>
+    <domain>NT AUTHORITY</domain>
+    <user>LocalService</user>
+  </serviceaccount>
+</service>
